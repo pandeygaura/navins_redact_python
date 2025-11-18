@@ -4,10 +4,11 @@ import io
 import zipfile
 import tempfile
 import traceback
+import base64
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse
 import requests
 
 from docx import Document
@@ -44,18 +45,17 @@ OCR_API_KEY = os.getenv("OCR_API_KEY", "K85450490888957").strip() or None
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyClP2B1jdADvbxd8I96w5Fok8aZZQfXEbQ").strip() or None
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro-latest")
 
-
 if genai and GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
     except Exception:
         genai = None
 
-app = FastAPI(title="Doc Redactor API", version="1.0")
+app = FastAPI(title="Doc Redactor API", version="2.0")
 
 
 # -------------------------------
-# PII PATTERNS
+# PII LABEL LIST
 # -------------------------------
 PII_LABELS = [
 
@@ -232,16 +232,16 @@ PATTERNS = {
     "Phone": r"\b\+?\d{1,3}?[-.\s]?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}\b",
     "Email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
     "CreditCard": r"\b(?:\d{4}[-\s]?){3}\d{4}\b",
-    "DateMMDDYYYY": r"\b(?:0?[1-9]|1[0-2])[\/\-.](?:0?[1-9]|[12]\d|3[01])[\/\-.]\d{4}\b",
+    "Date": r"\b(?:0?[1-9]|1[0-2])[\/\-.](?:0?[1-9]|[12]\d|3[01])[\/\-.]\d{4}\b"
 }
 
 
 # -------------------------------
-# FILE TYPE
+# File Type Detection
 # -------------------------------
 def detect_filetype(filename: str):
     ext = filename.lower().split(".")[-1]
-    if ext in ("jpg", "jpeg", "png", "bmp", "tiff", "tif"):
+    if ext in ("jpg","jpeg","png","bmp","tiff","tif"):
         return "image"
     if ext == "pdf":
         return "pdf"
@@ -253,7 +253,7 @@ def detect_filetype(filename: str):
 
 
 # -------------------------------
-# OCR.SPACE
+# OCR.space
 # -------------------------------
 def ocrspace_extract_bytes(file_bytes, filename, language="eng"):
     if not OCR_API_KEY:
@@ -261,19 +261,18 @@ def ocrspace_extract_bytes(file_bytes, filename, language="eng"):
     try:
         files = {"file": (filename, file_bytes)}
         data = {"apikey": OCR_API_KEY, "language": language, "OCREngine": 2}
-        resp = requests.post("https://api.ocr.space/parse/image",
-                             files=files, data=data, timeout=120)
+        resp = requests.post("https://api.ocr.space/parse/image", files=files, data=data, timeout=120)
         resp.raise_for_status()
         r = resp.json()
         if r.get("IsErroredOnProcessing"):
             return ""
-        return "\n".join(p.get("ParsedText", "") for p in r.get("ParsedResults", []))
+        return "\n".join(x.get("ParsedText", "") for x in r.get("ParsedResults", []))
     except Exception:
         return ""
 
 
 # -------------------------------
-# LOCAL OCR FALLBACK
+# Local OCR (Tesseract)
 # -------------------------------
 def pytesseract_extract_bytes(file_bytes, filename):
     if pytesseract is None or Image is None:
@@ -286,21 +285,16 @@ def pytesseract_extract_bytes(file_bytes, filename):
             img = Image.open(io.BytesIO(file_bytes))
             return pytesseract.image_to_string(img)
 
-        elif ftype == "pdf":
-            if convert_from_path:
-                with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
-                    tmp.write(file_bytes)
-                    tmp.flush()
-                    images = convert_from_path(tmp.name, dpi=200)
-
-                text = ""
-                for img in images:
-                    text += pytesseract.image_to_string(img) + "\n"
-                return text
-
-    except Exception:
+        if ftype == "pdf" and convert_from_path:
+            with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+                tmp.write(file_bytes); tmp.flush()
+                imgs = convert_from_path(tmp.name, dpi=200)
+            text = ""
+            for img in imgs:
+                text += pytesseract.image_to_string(img) + "\n"
+            return text
+    except:
         return ""
-
     return ""
 
 
@@ -310,78 +304,61 @@ def pytesseract_extract_bytes(file_bytes, filename):
 def docx_extract_bytes(file_bytes):
     try:
         with tempfile.NamedTemporaryFile(suffix=".docx") as tmp:
-            tmp.write(file_bytes)
-            tmp.flush()
+            tmp.write(file_bytes); tmp.flush()
             doc = Document(tmp.name)
         return "\n".join(p.text for p in doc.paragraphs)
-    except Exception:
+    except:
         return ""
 
 
 # -------------------------------
-# UNIFIED EXTRACTOR
+# Extract TEXT From any File
 # -------------------------------
 def extract_text_from_bytes(file_bytes, filename, language="eng"):
-    ftype = detect_filetype(filename)
+    t = detect_filetype(filename)
 
-    if ftype == "text":
+    if t == "text":
         return file_bytes.decode("utf-8", errors="ignore")
-
-    if ftype == "docx":
+    if t == "docx":
         return docx_extract_bytes(file_bytes)
+    if t in ("pdf", "image"):
+        txt = ocrspace_extract_bytes(file_bytes, filename, language)
+        if txt.strip(): return txt
 
-    if ftype in ("pdf", "image"):
-        # 1. OCR.space
-        if OCR_API_KEY:
-            txt = ocrspace_extract_bytes(file_bytes, filename, language)
-            if txt.strip():
-                return txt
-
-        # 2. pytesseract fallback
         txt = pytesseract_extract_bytes(file_bytes, filename)
-        if txt.strip():
-            return txt
+        if txt.strip(): return txt
 
     return ""
 
 
 # -------------------------------
-# GEMINI CLEAN
+# Gemini Fix (optional)
 # -------------------------------
 def fix_text_with_gemini(text):
     if genai is None:
         return text
-
     try:
         model = genai.GenerativeModel(GEMINI_MODEL)
-        prompt = f"""
-Clean OCR text:
-- fix OCR mistakes
-- remove random breaks
-- preserve formatting
-Return ONLY cleaned text.
-
-{text}
-"""
+        prompt = f"Clean OCR text, fix mistakes only:\n\n{text}"
         resp = model.generate_content([prompt])
         return (resp.text or "").strip()
-    except Exception:
+    except:
         return text
 
 
 # -------------------------------
-# REDACTION
+# Redaction
 # -------------------------------
-def blackout(s): return "█" * len(s) if s else s
+def blackout(s): return "█" * len(s)
 
 def redact_labels(text):
     for label in PII_LABELS:
-        pattern = rf"({re.escape(label)}\s*[:\-–]\s*)([^\n\r]+)"
-        text = re.sub(pattern, lambda m: m.group(1) + blackout(m.group(2)), text, flags=re.I)
+        p = rf"({re.escape(label)}\s*[:\-–]\s*)([^\n\r]+)"
+        text = re.sub(p, lambda m: m.group(1) + blackout(m.group(2)), text, flags=re.I)
     return text
 
 def redact_patterns(text):
-    for name, patt in PATTERNS.items():
+    for _, patt in PATTERNS.items():
         text = re.sub(patt, lambda m: blackout(m.group(0)), text, flags=re.I)
     return text
 
@@ -390,7 +367,7 @@ def redact_text_content(text):
 
 
 # -------------------------------
-# SAVE TO DOCX/PDF
+# Create DOCX
 # -------------------------------
 def make_docx_bytes(text):
     doc = Document()
@@ -398,11 +375,13 @@ def make_docx_bytes(text):
     for line in text.splitlines():
         doc.add_paragraph(line)
     buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
+    doc.save(buf); buf.seek(0)
     return buf.read()
 
 
+# -------------------------------
+# Create PDF
+# -------------------------------
 def make_pdf_bytes(text):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf)
@@ -414,53 +393,69 @@ def make_pdf_bytes(text):
 
 
 # -------------------------------
-# API ENDPOINTS
+# HEALTHCHECK
 # -------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
+# =====================================================
+# 1️⃣ MAIN ENDPOINT — ServiceNow-Compatible Response
+# =====================================================
 @app.post("/process")
 async def process_file(
     file: UploadFile = File(...),
     use_ai: bool = Form(False),
     language: str = Form("eng")
 ):
+    """
+    Returns:
+    {
+        "filename": "xyz.zip",
+        "content_type": "application/zip",
+        "file_base64": "<base64>"
+    }
+    Works 100% with ServiceNow attachment uploads.
+    """
     try:
         data = await file.read()
+
         if not data:
             raise HTTPException(400, "Empty file")
 
         text = extract_text_from_bytes(data, file.filename, language)
         if not text.strip():
-            raise HTTPException(422, "Failed to extract text from file.")
+            raise HTTPException(422, "Unable to extract text")
 
-        # Optional AI cleanup
         if use_ai:
             text = fix_text_with_gemini(text)
 
-        # Redact PII
         redacted = redact_text_content(text)
 
-        # Create files
+        # Create output files
         docx_bytes = make_docx_bytes(redacted)
         pdf_bytes = make_pdf_bytes(redacted)
 
-        # Make ZIP
+        # ZIP BOTH FILES
         zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
             base = os.path.splitext(file.filename)[0]
-            zf.writestr(f"{base}_cleaned_redacted.docx", docx_bytes)
-            zf.writestr(f"{base}_cleaned_redacted.pdf", pdf_bytes)
+            z.writestr(f"{base}_cleaned_redacted.docx", docx_bytes)
+            z.writestr(f"{base}_cleaned_redacted.pdf", pdf_bytes)
+
         zip_buf.seek(0)
+        zip_bytes = zip_buf.read()
 
-        return StreamingResponse(
-            zip_buf,
-            media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{base}_cleaned_redacted.zip"'}
-        )
+        # Convert ZIP → base64 (ServiceNow compatible)
+        zip_base64 = base64.b64encode(zip_bytes).decode()
 
-    except:
+        return JSONResponse({
+            "filename": f"{base}_cleaned_redacted.zip",
+            "content_type": "application/zip",
+            "file_base64": zip_base64
+        })
+
+    except Exception as e:
         traceback.print_exc()
-        raise HTTPException(500, "Server error during processing")
+        raise HTTPException(500, f"Server error: {str(e)}")
